@@ -1,0 +1,40 @@
+# Environment & Secrets
+.env
+*.env
+!.env.example
+!backend/.env.example
+backend/.env
+frontend/.env
+*.local
+
+# Database & SQLite files
+*.db
+*.sqlite
+*.sqlite3
+air_quality.db
+
+# Python & Virtualenv
+__pycache__/
+*.pyc
+*.py[cod]
+*$py.class
+venv/
+backend/venv/
+.venv/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node & Frontend
+node_modules/
+dist/
+dist-ssr/
+*.log
+
+# IDE & OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
