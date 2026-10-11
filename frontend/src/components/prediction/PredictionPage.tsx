@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import type { User } from '../../types/auth';
 import type { Location } from '../../types/air_quality';
 import type {
@@ -41,6 +41,8 @@ import {
 interface PredictionPageProps {
   currentUser: User;
   onNavigateToTab?: (tabId: string) => void;
+  initialSelectedLocationId?: number | null;
+  onLocationSelect?: (locationId: number) => void;
 }
 
 const HORIZONS: { hours: number; label: string; desc: string }[] = [
@@ -54,9 +56,13 @@ const HORIZONS: { hours: number; label: string; desc: string }[] = [
 export const PredictionPage: React.FC<PredictionPageProps> = ({
   currentUser,
   onNavigateToTab,
+  initialSelectedLocationId,
+  onLocationSelect,
 }) => {
   const [locations, setLocations] = useState<Location[]>([]);
-  const [selectedLocationId, setSelectedLocationId] = useState<number | null>(null);
+  const [selectedLocationId, setSelectedLocationId] = useState<number | null>(
+    initialSelectedLocationId ?? null
+  );
   const [selectedHorizon, setSelectedHorizon] = useState<number>(6);
   const [minObservations, setMinObservations] = useState<number>(24);
 
@@ -71,6 +77,21 @@ export const PredictionPage: React.FC<PredictionPageProps> = ({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [inputFreshness, setInputFreshness] = useState<string | null>(null);
 
+  const requestIdRef = useRef<number>(0);
+  const inFlightRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    let ignore = false;
+    Promise.resolve().then(() => {
+      if (!ignore && initialSelectedLocationId !== undefined && initialSelectedLocationId !== null) {
+        setSelectedLocationId(initialSelectedLocationId);
+      }
+    });
+    return () => {
+      ignore = true;
+    };
+  }, [initialSelectedLocationId]);
+
   const updateActivePrediction = (pred: PredictionResponse | null) => {
     setActivePrediction(pred);
     if (!pred?.base_timestamp) {
@@ -84,26 +105,109 @@ export const PredictionPage: React.FC<PredictionPageProps> = ({
   const canTrainAndPredict =
     currentUser.role === 'admin' || currentUser.role === 'analyst';
 
-  const loadStationPredictions = useCallback(
-    async (locationId: number) => {
-      try {
-        setErrorMsg(null);
-        const [latest, history] = await Promise.all([
-          getLatestPredictions(locationId),
-          getPredictionHistory(locationId, 20),
-        ]);
-        setLatestPredictions(latest);
-        setPredictionHistory(history);
+  const executePredictionWorkflow = useCallback(
+    async (locationId: number, horizon: number, force: boolean = false) => {
+      const reqKey = `${locationId}-${horizon}`;
+      if (!force && inFlightRef.current === reqKey) {
+        return;
+      }
 
-        // Find matching horizon prediction or pick the first available
-        const matching = latest.find((p) => p.horizon_hours === selectedHorizon);
-        updateActivePrediction(matching || (latest.length > 0 ? latest[0] : null));
-      } catch (err: unknown) {
-        // Non-blocking error
-        console.warn('Could not fetch predictions:', err);
+      const reqId = ++requestIdRef.current;
+      inFlightRef.current = reqKey;
+      setPredictingLoading(true);
+
+      if (canTrainAndPredict) {
+        try {
+          setErrorMsg(null);
+          const pred = await runPrediction({
+            location_id: locationId,
+            horizon_hours: horizon,
+          });
+
+          if (reqId !== requestIdRef.current) return;
+          updateActivePrediction(pred);
+
+          try {
+            const [latest, history] = await Promise.all([
+              getLatestPredictions(locationId),
+              getPredictionHistory(locationId, 20),
+            ]);
+            if (reqId === requestIdRef.current) {
+              setLatestPredictions(latest);
+              setPredictionHistory(history);
+            }
+          } catch {
+            // non-fatal background refresh error
+          }
+        } catch (err: any) {
+          if (reqId !== requestIdRef.current) return;
+
+          try {
+            const [latest, history] = await Promise.all([
+              getLatestPredictions(locationId),
+              getPredictionHistory(locationId, 20),
+            ]);
+            if (reqId === requestIdRef.current) {
+              setLatestPredictions(latest);
+              setPredictionHistory(history);
+              const matching = latest.find((p) => p.horizon_hours === horizon);
+              if (matching) {
+                updateActivePrediction(matching);
+              }
+            }
+          } catch {
+            // ignore fallback fetch error
+          }
+
+          const detailMsg =
+            err?.response?.data?.detail ||
+            err?.message ||
+            'Prediction generation failed. Ensure adequate training data is recorded.';
+          setErrorMsg(detailMsg);
+        } finally {
+          if (reqId === requestIdRef.current) {
+            inFlightRef.current = null;
+            setPredictingLoading(false);
+          }
+        }
+      } else {
+        // Viewer role: Cannot generate new predictions directly, read latest available
+        try {
+          setErrorMsg(null);
+          const [latest, history] = await Promise.all([
+            getLatestPredictions(locationId),
+            getPredictionHistory(locationId, 20),
+          ]);
+
+          if (reqId !== requestIdRef.current) return;
+
+          setLatestPredictions(latest);
+          setPredictionHistory(history);
+
+          const matching = latest.find((p) => p.horizon_hours === horizon);
+          if (matching) {
+            updateActivePrediction(matching);
+          } else {
+            updateActivePrediction(latest.length > 0 ? latest[0] : null);
+            setErrorMsg(
+              `Viewer Mode: No pre-computed +${horizon}h forecast found for this location. Admin or Analyst privileges required to generate new forecasts.`
+            );
+          }
+        } catch (err: any) {
+          if (reqId !== requestIdRef.current) return;
+          setErrorMsg(
+            err?.response?.data?.detail ||
+              'Could not load forecast data for this location.'
+          );
+        } finally {
+          if (reqId === requestIdRef.current) {
+            inFlightRef.current = null;
+            setPredictingLoading(false);
+          }
+        }
       }
     },
-    [selectedHorizon]
+    [canTrainAndPredict]
   );
 
   // Load locations on mount
@@ -116,7 +220,11 @@ export const PredictionPage: React.FC<PredictionPageProps> = ({
         if (!ignore) {
           setLocations(locs);
           if (locs.length > 0) {
-            setSelectedLocationId((prev) => prev ?? locs[0].id);
+            setSelectedLocationId((prev) => {
+              const nextId = prev ?? initialSelectedLocationId ?? locs[0].id;
+              onLocationSelect?.(nextId);
+              return nextId;
+            });
           }
         }
       } catch (err: unknown) {
@@ -134,22 +242,22 @@ export const PredictionPage: React.FC<PredictionPageProps> = ({
     return () => {
       ignore = true;
     };
-  }, []);
+  }, [initialSelectedLocationId, onLocationSelect]);
 
-  // Fetch prediction data whenever selectedLocationId changes
+  // Automatic Forecasting Effect: triggers whenever location or horizon changes
   useEffect(() => {
     let ignore = false;
     if (selectedLocationId) {
       Promise.resolve().then(() => {
         if (!ignore) {
-          loadStationPredictions(selectedLocationId);
+          executePredictionWorkflow(selectedLocationId, selectedHorizon);
         }
       });
     }
     return () => {
       ignore = true;
     };
-  }, [selectedLocationId, loadStationPredictions]);
+  }, [selectedLocationId, selectedHorizon, executePredictionWorkflow]);
 
   const handleHorizonSelect = (hours: number) => {
     setSelectedHorizon(hours);
@@ -173,7 +281,7 @@ export const PredictionPage: React.FC<PredictionPageProps> = ({
       if (res.status === 'INSUFFICIENT_DATA') {
         setErrorMsg(res.message);
       } else {
-        await loadStationPredictions(selectedLocationId);
+        await executePredictionWorkflow(selectedLocationId, selectedHorizon, true);
       }
     } catch (err: any) {
       setErrorMsg(err?.response?.data?.detail || 'Model training failed.');
@@ -183,21 +291,8 @@ export const PredictionPage: React.FC<PredictionPageProps> = ({
   };
 
   const handleGeneratePrediction = async () => {
-    if (!selectedLocationId || !canTrainAndPredict) return;
-    try {
-      setPredictingLoading(true);
-      setErrorMsg(null);
-      const pred = await runPrediction({
-        location_id: selectedLocationId,
-        horizon_hours: selectedHorizon,
-      });
-      updateActivePrediction(pred);
-      await loadStationPredictions(selectedLocationId);
-    } catch (err: any) {
-      setErrorMsg(err?.response?.data?.detail || 'Prediction generation failed.');
-    } finally {
-      setPredictingLoading(false);
-    }
+    if (!selectedLocationId) return;
+    await executePredictionWorkflow(selectedLocationId, selectedHorizon, true);
   };
 
   const selectedLoc = locations.find((l) => l.id === selectedLocationId);
@@ -252,7 +347,11 @@ export const PredictionPage: React.FC<PredictionPageProps> = ({
           <select
             className="bg-slate-900 border border-slate-700 text-slate-200 text-sm rounded-lg px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:outline-none"
             value={selectedLocationId || ''}
-            onChange={(e) => setSelectedLocationId(Number(e.target.value))}
+            onChange={(e) => {
+              const val = Number(e.target.value);
+              setSelectedLocationId(val);
+              onLocationSelect?.(val);
+            }}
             disabled={loading || locations.length === 0}
           >
             {locations.map((loc) => (
@@ -429,22 +528,30 @@ export const PredictionPage: React.FC<PredictionPageProps> = ({
 
             <button
               onClick={handleGeneratePrediction}
-              disabled={!canTrainAndPredict || predictingLoading}
+              disabled={predictingLoading}
               className={`w-full py-2.5 px-4 rounded-lg text-xs font-semibold flex items-center justify-center gap-2 transition shadow-lg ${
                 canTrainAndPredict
                   ? 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-600/20'
-                  : 'bg-indigo-900/30 text-slate-500 cursor-not-allowed'
+                  : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700'
               }`}
             >
               {predictingLoading ? (
                 <>
                   <RefreshCw className="w-3.5 h-3.5 animate-spin text-white" />
-                  <span>Generating Forecast...</span>
+                  <span>{canTrainAndPredict ? 'Generating Forecast...' : 'Refreshing Forecast...'}</span>
                 </>
               ) : (
                 <>
-                  <TrendingUp className="w-3.5 h-3.5 text-white" />
-                  <span>Generate Forecast (+{selectedHorizon}h)</span>
+                  {canTrainAndPredict ? (
+                    <TrendingUp className="w-3.5 h-3.5 text-white" />
+                  ) : (
+                    <RefreshCw className="w-3.5 h-3.5 text-slate-300" />
+                  )}
+                  <span>
+                    {canTrainAndPredict
+                      ? `Refresh / Generate (+${selectedHorizon}h)`
+                      : `Refresh Forecast (+${selectedHorizon}h)`}
+                  </span>
                 </>
               )}
             </button>
@@ -463,7 +570,13 @@ export const PredictionPage: React.FC<PredictionPageProps> = ({
               </span>
             </div>
 
-            {activePrediction ? (
+            {predictingLoading ? (
+              <div className="h-40 flex flex-col items-center justify-center text-indigo-400 text-xs text-center space-y-2">
+                <RefreshCw className="w-8 h-8 animate-spin text-indigo-400" />
+                <p className="text-slate-300 font-medium">Computing ML forecast (+{selectedHorizon}h)...</p>
+                <p className="text-[11px] text-slate-500">Evaluating multi-station atmospheric models</p>
+              </div>
+            ) : activePrediction ? (
               <div className="space-y-4">
                 <div className="flex items-baseline gap-4">
                   <div className="text-5xl font-black tracking-tight text-white">
@@ -522,7 +635,9 @@ export const PredictionPage: React.FC<PredictionPageProps> = ({
                 <BrainCircuit className="w-8 h-8 text-slate-600 mb-2" />
                 <p>No forecast record available for +{selectedHorizon}h.</p>
                 <p className="text-[11px] text-slate-600 mt-1">
-                  Click "Generate Forecast" above to run prediction.
+                  {canTrainAndPredict
+                    ? 'Use the controls to train model or refresh forecast.'
+                    : 'Awaiting administrator or analyst to run forecast.'}
                 </p>
               </div>
             )}

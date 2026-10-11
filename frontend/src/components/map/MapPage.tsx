@@ -29,6 +29,8 @@ import {
 
 interface MapPageProps {
   onNavigateToDashboard: (locationId: number) => void;
+  initialSelectedStationId?: number | null;
+  onSelectStation?: (stationId: number) => void;
 }
 
 const CATEGORY_FILTERS = [
@@ -43,12 +45,30 @@ const CATEGORY_FILTERS = [
 
 const SOURCE_FILTERS = ['All', 'API', 'UPLOADED', 'SIMULATED', 'DEMO'] as const;
 
-export const MapPage: React.FC<MapPageProps> = ({ onNavigateToDashboard }) => {
+export const MapPage: React.FC<MapPageProps> = ({
+  onNavigateToDashboard,
+  initialSelectedStationId,
+  onSelectStation,
+}) => {
   const [stations, setStations] = useState<StationMapItem[]>([]);
-  const [selectedStationId, setSelectedStationId] = useState<number | null>(null);
+  const [selectedStationId, setSelectedStationId] = useState<number | null>(
+    initialSelectedStationId ?? null
+  );
   const [loading, setLoading] = useState<boolean>(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<string>('');
+
+  useEffect(() => {
+    let ignore = false;
+    Promise.resolve().then(() => {
+      if (!ignore && initialSelectedStationId !== undefined && initialSelectedStationId !== null) {
+        setSelectedStationId(initialSelectedStationId);
+      }
+    });
+    return () => {
+      ignore = true;
+    };
+  }, [initialSelectedStationId]);
 
   // Filters State
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -134,6 +154,13 @@ export const MapPage: React.FC<MapPageProps> = ({ onNavigateToDashboard }) => {
 
   // Handle "Use My Location" in Map View
   const handleUseMyLocation = useCallback(() => {
+    if (typeof window !== 'undefined' && window.isSecureContext === false) {
+      setWorkflowState('ERROR');
+      setWorkflowError('Geolocation requires a secure context (HTTPS or localhost). Please access AeroPulse AI via HTTPS or localhost.');
+      setShowWorkflowNotice(true);
+      return;
+    }
+
     if (!navigator.geolocation) {
       setWorkflowState('ERROR');
       setWorkflowError('Geolocation is not supported by your browser.');
@@ -145,67 +172,92 @@ export const MapPage: React.FC<MapPageProps> = ({ onNavigateToDashboard }) => {
     setWorkflowError(null);
     setShowWorkflowNotice(true);
 
-    navigator.geolocation.getCurrentPosition(
-      async (position) => {
-        setWorkflowState('FINDING_STATION');
-        const { latitude, longitude, accuracy } = position.coords;
-        setUserLocation({ latitude, longitude });
+    const executeWorkflow = async (latitude: number, longitude: number, accuracy: number | null) => {
+      setWorkflowState('FINDING_STATION');
+      setUserLocation({ latitude, longitude });
 
-        try {
-          const res = await resolveLocationWorkflow({
-            latitude,
-            longitude,
-            accuracy_meters: accuracy || null,
-            radius_meters: 25000,
-          });
+      try {
+        const res = await resolveLocationWorkflow({
+          latitude,
+          longitude,
+          accuracy_meters: accuracy || null,
+          radius_meters: 25000,
+        });
 
-          setWorkflowResult(res);
+        setWorkflowResult(res);
 
-          if (res.status === 'SUCCESS' || res.status === 'PARTIAL_SUCCESS') {
-            setWorkflowState('SUCCESS');
-            if (res.resolved_station) {
-              const stationId = res.resolved_station.location_id ?? res.resolved_station.id ?? null;
+        if (res.status === 'SUCCESS' || res.status === 'PARTIAL_SUCCESS') {
+          setWorkflowState('SUCCESS');
+          if (res.resolved_station) {
+            const stationId = res.resolved_station.location_id ?? res.resolved_station.id ?? null;
+            if (stationId) {
               setSelectedStationId(stationId);
-              setResolvedDistanceKm(res.resolved_station.distance_km);
-              loadMapData();
+              onSelectStation?.(stationId);
             }
-          } else if (res.status === 'NO_STATIONS_FOUND') {
-            setWorkflowState('NO_STATION');
-            setResolvedDistanceKm(null);
-          } else {
-            setWorkflowState('ERROR');
-            setWorkflowError(res.message || 'Unable to resolve nearby monitoring station.');
+            setResolvedDistanceKm(res.resolved_station.distance_km);
+            loadMapData();
           }
-        } catch (err: any) {
+        } else if (res.status === 'NO_STATIONS_FOUND') {
+          setWorkflowState('NO_STATION');
+          setResolvedDistanceKm(null);
+        } else {
           setWorkflowState('ERROR');
-          setWorkflowError(
-            err.response?.data?.detail?.message ||
-              err.message ||
-              'Failed to communicate with location workflow service. Please try again.'
-          );
+          setWorkflowError(res.message || 'Unable to resolve nearby monitoring station.');
         }
+      } catch (err: any) {
+        setWorkflowState('ERROR');
+        setWorkflowError(
+          err.response?.data?.detail?.message ||
+            err.message ||
+            'Failed to communicate with location workflow service. Please try again.'
+        );
+      }
+    };
+
+    const tryLowAccuracy = () => {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          executeWorkflow(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy || null);
+        },
+        (err) => {
+          setWorkflowState('ERROR');
+          if (err.code === err.PERMISSION_DENIED) {
+            setWorkflowError(
+              'Location access was denied. Please allow location permissions in your browser to find nearby stations.'
+            );
+          } else if (err.code === err.POSITION_UNAVAILABLE) {
+            setWorkflowError('Location information is currently unavailable from your device or network.');
+          } else if (err.code === err.TIMEOUT) {
+            setWorkflowError('Location detection timed out. Please check device location settings and try again.');
+          } else {
+            setWorkflowError('An unexpected error occurred while detecting your location.');
+          }
+        },
+        { enableHighAccuracy: false, timeout: 15000, maximumAge: 300000 }
+      );
+    };
+
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        executeWorkflow(position.coords.latitude, position.coords.longitude, position.coords.accuracy || null);
       },
       (geoError) => {
-        setWorkflowState('ERROR');
         if (geoError.code === geoError.PERMISSION_DENIED) {
+          setWorkflowState('ERROR');
           setWorkflowError(
-            'Location access was denied. Please allow browser location access to discover nearby stations.'
+            'Location access was denied. Please allow browser location access in settings to discover nearby stations.'
           );
-        } else if (geoError.code === geoError.POSITION_UNAVAILABLE) {
-          setWorkflowError('Location information is currently unavailable from your device.');
-        } else if (geoError.code === geoError.TIMEOUT) {
-          setWorkflowError('Location request timed out. Please try again.');
         } else {
-          setWorkflowError('An unknown error occurred while detecting your location.');
+          tryLowAccuracy();
         }
       },
       {
         enableHighAccuracy: true,
-        timeout: 10000,
+        timeout: 8000,
         maximumAge: 60000,
       }
     );
-  }, [loadMapData]);
+  }, [loadMapData, onSelectStation]);
 
   // Client-side filtering
   const filteredStations = stations.filter((item) => {
@@ -486,7 +538,10 @@ export const MapPage: React.FC<MapPageProps> = ({ onNavigateToDashboard }) => {
           selectedStationId={selectedStationId}
           userLocation={userLocation}
           resolvedStationDistanceKm={resolvedDistanceKm}
-          onSelectStation={(id) => setSelectedStationId(id)}
+          onSelectStation={(id) => {
+            setSelectedStationId(id);
+            onSelectStation?.(id);
+          }}
           onNavigateToDashboard={onNavigateToDashboard}
         />
       )}
@@ -497,7 +552,10 @@ export const MapPage: React.FC<MapPageProps> = ({ onNavigateToDashboard }) => {
           <StationList
             stations={filteredStations}
             selectedStationId={selectedStationId}
-            onSelectStation={(id) => setSelectedStationId(id)}
+            onSelectStation={(id) => {
+              setSelectedStationId(id);
+              onSelectStation?.(id);
+            }}
             onNavigateToDashboard={onNavigateToDashboard}
           />
         </div>

@@ -68,6 +68,7 @@ interface DashboardPageProps {
   currentUser?: User | null;
   initialSelectedLocationId?: number | null;
   onNavigateToTab?: (tabId: string) => void;
+  onLocationSelect?: (locationId: number) => void;
 }
 
 type TimeRangeKey = '24h' | '48h' | '7d' | '30d';
@@ -83,6 +84,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   currentUser: _currentUser,
   initialSelectedLocationId,
   onNavigateToTab,
+  onLocationSelect,
 }) => {
   // Selection State
   const [locations, setLocations] = useState<Location[]>([]);
@@ -153,101 +155,6 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     };
   }, [timeRange]);
 
-  // Handle "Use My Location" automatic workflow orchestration
-  const handleUseMyLocation = useCallback(() => {
-    if (!navigator.geolocation) {
-      setWorkflowState('ERROR');
-      setWorkflowError('Geolocation is not supported by your browser.');
-      setShowWorkflowNotice(true);
-      return;
-    }
-
-    setWorkflowState('DETECTING_LOCATION');
-    setWorkflowError(null);
-    setShowWorkflowNotice(true);
-
-    navigator.geolocation.getCurrentPosition(
-      async (position) => {
-        setWorkflowState('FINDING_STATION');
-        const { latitude, longitude, accuracy } = position.coords;
-        try {
-          const res = await resolveLocationWorkflow({
-            latitude,
-            longitude,
-            accuracy_meters: accuracy || null,
-            radius_meters: 25000,
-          });
-
-          setWorkflowResult(res);
-
-          if (res.status === 'SUCCESS' || res.status === 'PARTIAL_SUCCESS') {
-            setWorkflowState('SUCCESS');
-            if (res.resolved_station) {
-              const resolved = res.resolved_station;
-              const stationId = resolved.location_id ?? resolved.id ?? 0;
-              // Check if location is already present in dropdown, if not add it
-              setLocations((prev) => {
-                if (!prev.some((l) => l.id === stationId)) {
-                  return [
-                    ...prev,
-                    {
-                      id: stationId,
-                      name: resolved.name,
-                      city: resolved.city,
-                      state: resolved.state || '',
-                      country: resolved.country || 'India',
-                      latitude: resolved.latitude,
-                      longitude: resolved.longitude,
-                      is_active: true,
-                      description: `OpenAQ station ID ${resolved.external_id}`,
-                      external_provider: 'OPENAQ',
-                      external_id: String(resolved.external_id),
-                      created_at: new Date().toISOString(),
-                      updated_at: new Date().toISOString(),
-                    },
-                  ];
-                }
-                return prev;
-              });
-              setSelectedLocationId(stationId);
-            }
-          } else if (res.status === 'NO_STATIONS_FOUND') {
-            setWorkflowState('NO_STATION');
-          } else {
-            setWorkflowState('ERROR');
-            setWorkflowError(res.message || 'Unable to resolve nearby monitoring station.');
-          }
-        } catch (err: any) {
-          setWorkflowState('ERROR');
-          setWorkflowError(
-            err.response?.data?.detail?.message ||
-              err.message ||
-              'Failed to communicate with location workflow service. Please try again.'
-          );
-        }
-      },
-      (geoError) => {
-        setWorkflowState('ERROR');
-        if (geoError.code === geoError.PERMISSION_DENIED) {
-          setWorkflowError(
-            'Location access was denied. Please allow browser location access or select a station manually.'
-          );
-        } else if (geoError.code === geoError.POSITION_UNAVAILABLE) {
-          setWorkflowError('Location information is currently unavailable from your device.');
-        } else if (geoError.code === geoError.TIMEOUT) {
-          setWorkflowError('Location request timed out. Please try again.');
-        } else {
-          setWorkflowError('An unknown error occurred while detecting your location.');
-        }
-      },
-      {
-        enableHighAccuracy: true,
-        timeout: 10000,
-        maximumAge: 60000,
-      }
-    );
-  }, []);
-
   // Initial Load: Fetch Locations
   useEffect(() => {
     let ignore = false;
@@ -259,6 +166,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
           setLocations(locs);
           if (locs.length > 0 && selectedLocationId === null) {
             setSelectedLocationId(locs[0].id);
+            onLocationSelect?.(locs[0].id);
           }
         }
       } catch {
@@ -275,11 +183,12 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     return () => {
       ignore = true;
     };
-  }, [selectedLocationId]);
+  }, [selectedLocationId, onLocationSelect]);
 
   // Load Primary Dashboard Data
-  const loadDashboardData = useCallback(async () => {
-    if (!selectedLocationId) return;
+  const loadDashboardData = useCallback(async (targetLocationId?: number) => {
+    const locId = targetLocationId ?? selectedLocationId;
+    if (!locId) return;
 
     setLoadingDashboard(true);
     setErrorMessage(null);
@@ -300,26 +209,26 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
         recsRes,
         trustRes,
       ] = await Promise.allSettled([
-        getCurrentReading(selectedLocationId),
-        getLatestAQI(selectedLocationId),
+        getCurrentReading(locId),
+        getLatestAQI(locId),
         getAQITrend({
-          location_id: selectedLocationId,
+          location_id: locId,
           aggregation: aqiAggregation,
           start_time,
           end_time,
         }),
         getLocationSummary({
-          location_id: selectedLocationId,
+          location_id: locId,
           start_time,
           end_time,
         }),
         getAnomalies({
-          location_id: selectedLocationId,
+          location_id: locId,
           start_time,
           end_time,
         }),
         getPollutionEvents({
-          location_id: selectedLocationId,
+          location_id: locId,
           start_time,
           end_time,
         }),
@@ -331,12 +240,12 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
           start_time,
           end_time,
         }),
-        getActiveAlerts(selectedLocationId),
-        getRecommendationsForLocation(selectedLocationId, {
+        getActiveAlerts(locId),
+        getRecommendationsForLocation(locId, {
           include_forecast: true,
           include_alerts: true,
         }),
-        getStationTrust(selectedLocationId),
+        getStationTrust(locId),
       ]);
 
       if (readingRes.status === 'fulfilled') {
@@ -380,6 +289,134 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       setLoadingDashboard(false);
     }
   }, [selectedLocationId, aqiAggregation, getRangeISO]);
+
+  // Handle "Use My Location" automatic workflow orchestration
+  const handleUseMyLocation = useCallback(() => {
+    if (
+      typeof window !== 'undefined' &&
+      !window.isSecureContext &&
+      window.location.hostname !== 'localhost' &&
+      window.location.hostname !== '127.0.0.1'
+    ) {
+      setWorkflowState('ERROR');
+      setWorkflowError(
+        'Browser location detection requires a secure HTTPS connection. Please access via HTTPS or select a station manually.'
+      );
+      setShowWorkflowNotice(true);
+      return;
+    }
+
+    if (!navigator.geolocation) {
+      setWorkflowState('ERROR');
+      setWorkflowError('Geolocation is not supported by your browser. Please select a station manually from the list.');
+      setShowWorkflowNotice(true);
+      return;
+    }
+
+    setWorkflowState('DETECTING_LOCATION');
+    setWorkflowError(null);
+    setShowWorkflowNotice(true);
+
+    const onGeoSuccess = async (position: GeolocationPosition) => {
+      setWorkflowState('FINDING_STATION');
+      const { latitude, longitude, accuracy } = position.coords;
+      try {
+        const res = await resolveLocationWorkflow({
+          latitude,
+          longitude,
+          accuracy_meters: accuracy || null,
+          radius_meters: 25000,
+        });
+
+        setWorkflowResult(res);
+
+        if (res.status === 'SUCCESS' || res.status === 'PARTIAL_SUCCESS') {
+          setWorkflowState('SUCCESS');
+          if (res.resolved_station) {
+            const resolved = res.resolved_station;
+            const stationId = resolved.location_id ?? resolved.id ?? 0;
+            if (stationId > 0) {
+              setLocations((prev) => {
+                if (!prev.some((l) => l.id === stationId)) {
+                  return [
+                    ...prev,
+                    {
+                      id: stationId,
+                      name: resolved.name,
+                      city: resolved.city,
+                      state: resolved.state || '',
+                      country: resolved.country || 'India',
+                      latitude: resolved.latitude,
+                      longitude: resolved.longitude,
+                      is_active: true,
+                      description: `OpenAQ station ID ${resolved.external_id}`,
+                      external_provider: 'OPENAQ',
+                      external_id: String(resolved.external_id),
+                      created_at: new Date().toISOString(),
+                      updated_at: new Date().toISOString(),
+                    },
+                  ];
+                }
+                return prev;
+              });
+              setSelectedLocationId(stationId);
+              onLocationSelect?.(stationId);
+              loadDashboardData(stationId);
+            }
+          }
+        } else if (res.status === 'NO_STATIONS_FOUND') {
+          setWorkflowState('NO_STATION');
+        } else {
+          setWorkflowState('ERROR');
+          setWorkflowError(res.message || 'Unable to resolve nearby monitoring station within 25 km.');
+        }
+      } catch (err: any) {
+        setWorkflowState('ERROR');
+        setWorkflowError(
+          err.response?.data?.detail?.message ||
+            err.response?.data?.detail ||
+            err.message ||
+            'Failed to communicate with location workflow service. Please try again or select a station manually.'
+        );
+      }
+    };
+
+    const onGeoError = (geoError: GeolocationPositionError) => {
+      setWorkflowState('ERROR');
+      if (geoError.code === geoError.PERMISSION_DENIED) {
+        setWorkflowError(
+          'Location access was denied. Please allow browser location access in your browser settings or select a station manually.'
+        );
+      } else if (geoError.code === geoError.POSITION_UNAVAILABLE) {
+        setWorkflowError('Location information is currently unavailable from your device. Please select a station manually.');
+      } else if (geoError.code === geoError.TIMEOUT) {
+        setWorkflowError('Location request timed out. Please try again or select a station manually.');
+      } else {
+        setWorkflowError('An unknown error occurred while detecting your location. Please select a station manually.');
+      }
+    };
+
+    // Attempt geolocation with high accuracy first, falling back to standard accuracy on timeout/unavailable
+    navigator.geolocation.getCurrentPosition(
+      onGeoSuccess,
+      (firstErr) => {
+        if (firstErr.code === firstErr.TIMEOUT || firstErr.code === firstErr.POSITION_UNAVAILABLE) {
+          navigator.geolocation.getCurrentPosition(
+            onGeoSuccess,
+            onGeoError,
+            { enableHighAccuracy: false, timeout: 15000, maximumAge: 300000 }
+          );
+        } else {
+          onGeoError(firstErr);
+        }
+      },
+      {
+        enableHighAccuracy: true,
+        timeout: 8000,
+        maximumAge: 60000,
+      }
+    );
+  }, [loadDashboardData, onLocationSelect]);
 
   // Load Pollutant Trend (triggers when selectedPollutant or aggregation changes)
   const loadPollutantTrend = useCallback(async () => {
@@ -469,7 +506,11 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
               <select
                 aria-label="Select Monitored Station"
                 value={selectedLocationId || ''}
-                onChange={(e) => setSelectedLocationId(Number(e.target.value))}
+                onChange={(e) => {
+                  const val = Number(e.target.value);
+                  setSelectedLocationId(val);
+                  onLocationSelect?.(val);
+                }}
                 disabled={loadingLocations}
                 className="bg-transparent text-xs font-semibold text-slate-200 outline-none cursor-pointer pr-4"
               >
@@ -967,13 +1008,19 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
         <LocationComparisonTable
           locations={comparison}
           selectedLocationId={selectedLocationId || undefined}
-          onSelectLocation={(locId) => setSelectedLocationId(locId)}
+          onSelectLocation={(locId) => {
+            setSelectedLocationId(locId);
+            onLocationSelect?.(locId);
+          }}
           isLoading={loadingDashboard}
         />
         <HotspotIndicatorsTable
           hotspots={hotspots}
           selectedLocationId={selectedLocationId || undefined}
-          onSelectLocation={(locId) => setSelectedLocationId(locId)}
+          onSelectLocation={(locId) => {
+            setSelectedLocationId(locId);
+            onLocationSelect?.(locId);
+          }}
           isLoading={loadingDashboard}
         />
       </div>

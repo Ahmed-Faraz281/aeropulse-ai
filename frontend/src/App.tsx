@@ -118,9 +118,12 @@ export function App() {
               currentUser={currentUser}
               initialSelectedLocationId={selectedLocationId}
               onNavigateToTab={(tab) => setActiveTab(tab)}
+              onLocationSelect={(locationId) => setSelectedLocationId(locationId)}
             />
           ) : activeTab === 'map' ? (
             <MapPage
+              initialSelectedStationId={selectedLocationId}
+              onSelectStation={(locationId) => setSelectedLocationId(locationId)}
               onNavigateToDashboard={(locationId) => {
                 setSelectedLocationId(locationId);
                 setActiveTab('dashboard');
@@ -134,7 +137,9 @@ export function App() {
           ) : activeTab === 'predictions' ? (
             <PredictionPage
               currentUser={currentUser}
+              initialSelectedLocationId={selectedLocationId}
               onNavigateToTab={(tab) => setActiveTab(tab)}
+              onLocationSelect={(locationId) => setSelectedLocationId(locationId)}
             />
           ) : activeTab === 'alerts' ? (
             <AlertsPage
