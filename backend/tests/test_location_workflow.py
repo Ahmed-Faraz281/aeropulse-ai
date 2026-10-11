@@ -950,3 +950,114 @@ def test_determinism_identical_inputs_produce_identical_selection(db_session):
 
             assert res1.resolved_station.external_id == res2.resolved_station.external_id
             assert res1.resolved_station.external_id == 1
+
+
+# ==============================================================================
+# 12. PostgreSQL External ID Type Mismatch Regression Tests
+# ==============================================================================
+
+def test_normalize_external_id_utility():
+    from backend.app.models.location import normalize_external_id
+    assert normalize_external_id(6984) == "6984"
+    assert normalize_external_id("6984") == "6984"
+    assert normalize_external_id(" 6984 ") == "6984"
+    assert normalize_external_id(0) == "0"
+    assert normalize_external_id(None) is None
+    assert normalize_external_id("") is None
+    assert normalize_external_id("   ") is None
+
+
+def test_location_model_validates_numeric_external_id_to_string(db_session):
+    loc = Location(
+        name="Render Station 6984",
+        city="Delhi",
+        state="Delhi",
+        country="India",
+        latitude=28.61,
+        longitude=77.23,
+        external_provider="OPENAQ",
+        external_id=6984,  # Pass as integer
+        is_active=True,
+    )
+    assert loc.external_id == "6984"
+    assert isinstance(loc.external_id, str)
+    db_session.add(loc)
+    db_session.commit()
+    db_session.refresh(loc)
+    assert loc.external_id == "6984"
+    assert isinstance(loc.external_id, str)
+    assert isinstance(loc.id, int)  # Primary key remains integer
+
+    # Updating with integer also normalizes to string
+    loc.external_id = 9999
+    assert loc.external_id == "9999"
+    assert isinstance(loc.external_id, str)
+
+
+def test_location_external_id_query_compilation_type_compatibility():
+    """
+    Verifies that querying Location by external_id uses a VARCHAR bound parameter,
+    preventing PostgreSQL 'operator does not exist: character varying = integer' errors.
+    """
+    from sqlalchemy.dialects import postgresql
+    from backend.app.models.location import normalize_external_id
+
+    # Simulated OpenAQ station ID returned from external API as int
+    numeric_openaq_id = 6984
+
+    # Using normalized external_id
+    normalized_val = normalize_external_id(numeric_openaq_id)
+    expr = Location.external_id == normalized_val
+
+    # Right operand must be of type string / VARCHAR, not int / INTEGER
+    assert isinstance(expr.right.value, str)
+    assert str(expr.right.type).startswith("VARCHAR")
+
+    # PostgreSQL compilation must succeed and compile as VARCHAR comparison
+    compiled = str(expr.compile(dialect=postgresql.dialect()))
+    assert "locations.external_id =" in compiled
+
+
+def test_location_workflow_alternative_station_numeric_id_matches_stored_string(db_session):
+    """
+    Regression test for Render live issue:
+    Verifies that when an alternative station has numeric OpenAQ station ID 6984,
+    it correctly matches an existing database location stored with external_id='6984',
+    resolving the existing location_id and preventing type mismatch in queries.
+    """
+    # Pre-seed existing location with external_id '6984'
+    existing_loc = Location(
+        name="Anand Vihar OpenAQ 6984",
+        city="Delhi",
+        state="Delhi",
+        country="India",
+        latitude=28.65,
+        longitude=77.30,
+        external_provider="OPENAQ",
+        external_id="6984",
+        is_active=True,
+    )
+    db_session.add(existing_loc)
+    db_session.commit()
+    db_session.refresh(existing_loc)
+
+    service = LocationWorkflowService(db=db_session)
+    user_lat, user_lon = 28.60, 77.20
+
+    # s1 is primary candidate (id=1001), s2 is alternative candidate with numeric id=6984
+    s1 = make_mock_openaq_location(1001, "Primary Station", 28.61, 77.21, ["pm25"])
+    s2 = make_mock_openaq_location(6984, "Anand Vihar OpenAQ 6984", 28.65, 77.30, ["pm25"])
+
+    with patch.object(service.openaq, "search_locations", return_value=[s1, s2]):
+        with patch.object(service.ingest_service, "ingest"):
+            req = LocationWorkflowRequest(latitude=user_lat, longitude=user_lon, radius_meters=25000, force_refresh=True)
+            res = service.resolve_location(req)
+
+            assert res.status in ("SUCCESS", "PARTIAL_SUCCESS")
+            assert len(res.alternative_stations) == 1
+            alt = res.alternative_stations[0]
+            assert alt.external_id == 6984
+            assert alt.location_id == existing_loc.id
+            assert isinstance(alt.location_id, int)
+            assert alt.location_id > 0
+

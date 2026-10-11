@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from backend.app.models.air_quality import AirQualityReading, QualityStatus
 from backend.app.models.aqi import AQIRecord
 from backend.app.models.data_source import DataSource, SourceType
-from backend.app.models.location import Location
+from backend.app.models.location import Location, normalize_external_id
 from backend.app.schemas.air_quality import AirQualityReadingCreate
 from backend.app.schemas.openaq import (
     OpenAQIngestRequest,
@@ -508,7 +508,7 @@ class OpenAQIngestionService:
         Maps an OpenAQ station to an AeroPulse Location with external_provider and external_id.
         Applies strict metadata safety: never sets state = country_name.
         """
-        ext_id = str(openaq_loc.id)
+        ext_id = normalize_external_id(openaq_loc.id)
         existing = (
             self.db.query(Location)
             .filter(

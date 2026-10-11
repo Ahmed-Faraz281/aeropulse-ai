@@ -1,7 +1,20 @@
 from datetime import datetime, timezone
+from typing import Any, Optional
 from sqlalchemy import Boolean, Column, DateTime, Float, Index, Integer, String, Text, text
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, validates
 from backend.app.core.database import Base
+
+
+def normalize_external_id(value: Any) -> Optional[str]:
+    """
+    Normalizes provider-specific external IDs to the string representation
+    expected by the database `locations.external_id` VARCHAR column.
+    Handles numeric IDs (e.g. OpenAQ integer IDs), string IDs, or None.
+    """
+    if value is None:
+        return None
+    val_str = str(value).strip()
+    return val_str if val_str else None
 
 
 class Location(Base):
@@ -20,6 +33,10 @@ class Location(Base):
     # External Provider Mapping (Phase 17 Step 2)
     external_provider = Column(String(32), nullable=True, index=True)
     external_id = Column(String(64), nullable=True, index=True)
+
+    @validates("external_id")
+    def validate_external_id(self, key: str, value: Any) -> Optional[str]:
+        return normalize_external_id(value)
 
     created_at = Column(
         DateTime(timezone=True),

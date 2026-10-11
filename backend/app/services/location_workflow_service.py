@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from backend.app.models.air_quality import AirQualityReading, QualityStatus
 from backend.app.models.aqi import AQIRecord
 from backend.app.models.data_source import DataSource, SourceType
-from backend.app.models.location import Location
+from backend.app.models.location import Location, normalize_external_id
 from backend.app.schemas.alert import AlertResponse
 from backend.app.schemas.aqi import AQIResponse
 from backend.app.schemas.location_workflow import (
@@ -212,11 +212,12 @@ class LocationWorkflowService:
         primary_cand, primary_dist_km = inside_radius[0]
 
         # Check if station already exists in database
+        primary_ext_id = normalize_external_id(primary_cand.id)
         existing_loc = (
             self.db.query(Location)
             .filter(
                 Location.external_provider == "OPENAQ",
-                Location.external_id == str(primary_cand.id),
+                Location.external_id == primary_ext_id,
             )
             .first()
         )
@@ -306,8 +307,16 @@ class LocationWorkflowService:
         for alt_cand, alt_dist in inside_radius[1:4]:
             alt_freshness = "FRESH" if alt_cand.datetime_last and (datetime.now(timezone.utc) - alt_cand.datetime_last).total_seconds() < 10800 else "STALE"
             alt_pollutants = [s.parameter_name.upper() for s in alt_cand.sensors if s.parameter_name.lower() in SUPPORTED_POLLUTANTS]
-            # Try to get existing DB location id if registered
-            alt_loc = self.db.query(Location).filter(Location.external_provider == "OPENAQ", Location.external_id == alt_cand.id).first()
+            # Try to get existing DB location id if registered (ensuring string comparison for VARCHAR column)
+            alt_ext_id = normalize_external_id(alt_cand.id)
+            alt_loc = (
+                self.db.query(Location)
+                .filter(
+                    Location.external_provider == "OPENAQ",
+                    Location.external_id == alt_ext_id,
+                )
+                .first()
+            )
             alternative_stations.append(
                 ResolvedStationInfo(
                     location_id=alt_loc.id if alt_loc else 0,
@@ -511,9 +520,15 @@ class LocationWorkflowService:
         for l in local_locs:
             if l.latitude is None or l.longitude is None:
                 continue
+            cand_id = l.id
+            if l.external_id:
+                try:
+                    cand_id = int(l.external_id)
+                except (ValueError, TypeError):
+                    cand_id = l.id
             candidates.append(
                 OpenAQLocationNormalized(
-                    id=l.external_id or l.id,
+                    id=cand_id,
                     name=l.name,
                     locality=l.city,
                     country_code="IN",
