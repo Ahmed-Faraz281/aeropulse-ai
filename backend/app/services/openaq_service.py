@@ -316,25 +316,64 @@ class OpenAQService:
     def get_sensor_hours(
         self,
         sensor_id: int,
-        limit: int = 24,
+        limit: int = 100,
+        page: Optional[int] = None,
         datetime_from: Optional[datetime] = None,
         datetime_to: Optional[datetime] = None,
+        max_pages: int = 100,
     ) -> OpenAQSensorHoursResponse:
-        """Fetch normalized hourly measurements for a sensor."""
-        params: Dict[str, Any] = {"limit": limit}
+        """
+        Fetch normalized hourly measurements for a sensor.
+        If `page` is provided, fetches only that single page.
+        If `page` is None (default), iteratively fetches pages until exhausted
+        (len(results) < limit or len(results) == 0 or total reached) up to max_pages.
+        Deduplicates observations across pages based on UTC datetime.
+        """
+        base_params: Dict[str, Any] = {"limit": limit}
         if datetime_from:
-            params["datetime_from"] = datetime_from.isoformat()
+            base_params["datetime_from"] = datetime_from.isoformat()
         if datetime_to:
-            params["datetime_to"] = datetime_to.isoformat()
+            base_params["datetime_to"] = datetime_to.isoformat()
 
-        data = self._request("GET", f"/sensors/{sensor_id}/hours", params=params)
-        results = data.get("results", [])
+        all_results: List[Dict[str, Any]] = []
+
+        if page is not None:
+            # Single-page mode
+            params = {**base_params, "page": page}
+            data = self._request("GET", f"/sensors/{sensor_id}/hours", params=params)
+            all_results = data.get("results") or []
+        else:
+            # Multi-page pagination loop
+            cur_page = 1
+            while cur_page <= max_pages:
+                params = {**base_params, "page": cur_page}
+                data = self._request("GET", f"/sensors/{sensor_id}/hours", params=params)
+                page_results = data.get("results") or []
+                if not page_results:
+                    break
+
+                all_results.extend(page_results)
+
+                meta = data.get("meta") or {}
+                found = meta.get("found") if isinstance(meta, dict) else None
+
+                # If returned less than requested limit, no further pages exist
+                if len(page_results) < limit:
+                    break
+
+                # If found is an int and we collected at least found records
+                if isinstance(found, int) and len(all_results) >= found:
+                    break
+
+                cur_page += 1
 
         # Fetch sensor metadata to supply parameter_name and units
         sensor_meta = self.get_sensor(sensor_id)
 
         measurements: List[OpenAQHourlyMeasurement] = []
-        for item in results:
+        seen_hours: Set[datetime] = set()
+
+        for item in all_results:
             period = item.get("period", {})
             dt_from_raw = period.get("datetimeFrom", {})
             dt_to_raw = period.get("datetimeTo", {})
@@ -345,6 +384,11 @@ class OpenAQService:
             # Require valid UTC dates
             if not dt_from_utc or not dt_to_utc:
                 continue
+
+            # Deduplicate by datetime_from_utc across overlapping pages
+            if dt_from_utc in seen_hours:
+                continue
+            seen_hours.add(dt_from_utc)
 
             dt_from_local = dt_from_raw.get("local") if isinstance(dt_from_raw, dict) else None
             dt_to_local = dt_to_raw.get("local") if isinstance(dt_to_raw, dict) else None

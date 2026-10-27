@@ -53,7 +53,7 @@ def init_db(db: Session) -> None:
         if "prediction_records" in table_names:
             pred_cols = [c["name"] for c in inspector.get_columns("prediction_records")]
             if "is_prediction" not in pred_cols:
-                db.execute(text("ALTER TABLE prediction_records ADD COLUMN is_prediction BOOLEAN DEFAULT 1;"))
+                db.execute(text("ALTER TABLE prediction_records ADD COLUMN is_prediction BOOLEAN DEFAULT TRUE;"))
                 logger.info("Added column is_prediction to prediction_records table")
 
         db.commit()

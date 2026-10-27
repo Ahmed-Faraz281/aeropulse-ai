@@ -1,14 +1,20 @@
 import React from 'react';
 import type { AirQualityReading } from '../../types/air_quality';
+import type { AQIResponse } from '../../types/aqi';
 import { PollutantPillCard } from '../common/PollutantPillCard';
 import { Wind, Thermometer, Droplets, Compass, Gauge } from 'lucide-react';
 
 interface PollutantOverviewProps {
   reading: AirQualityReading | null;
+  latestAQI?: AQIResponse | null;
   isLoading: boolean;
 }
 
-export const PollutantOverview: React.FC<PollutantOverviewProps> = ({ reading, isLoading }) => {
+export const PollutantOverview: React.FC<PollutantOverviewProps> = ({
+  reading,
+  latestAQI,
+  isLoading,
+}) => {
   if (isLoading) {
     return (
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 animate-pulse">
@@ -29,7 +35,7 @@ export const PollutantOverview: React.FC<PollutantOverviewProps> = ({ reading, i
           CPCB Monitored Pollutants (8 Parameters)
         </h3>
         <span className="text-[11px] text-slate-500 font-mono">
-          Concentrations
+          Concentrations &amp; Sub-Indices
         </span>
       </div>
 
@@ -41,12 +47,15 @@ export const PollutantOverview: React.FC<PollutantOverviewProps> = ({ reading, i
             val !== null && val !== undefined && typeof val === 'number' && !Number.isNaN(val)
               ? val
               : null;
+          const subIndex = latestAQI?.pollutant_subindices?.[key] ?? null;
 
           return (
             <PollutantPillCard
               key={key}
               code={key}
               concentration={numVal}
+              subIndex={subIndex}
+              category={latestAQI?.category}
             />
           );
         })}

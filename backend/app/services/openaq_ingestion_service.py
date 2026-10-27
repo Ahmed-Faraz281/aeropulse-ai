@@ -162,7 +162,7 @@ class OpenAQIngestionService:
     def ingest(self, request: OpenAQIngestRequest) -> OpenAQIngestResponse:
         """
         Executes bounded multi-station discovery and ingestion.
-        Guaranteed safety limits: max 5 stations per request, max 14 days history.
+        Guaranteed safety limits: max 5 stations per request, max 30 days history.
         """
         start_time = time.time()
         errors: List[str] = []
@@ -275,6 +275,17 @@ class OpenAQIngestionService:
                 total_obs_fetched += fetched_count
                 total_warnings += warn_count
                 all_pollutants_mapped.update(mapped_params)
+
+                if fetched_count == 0:
+                    logger.info(
+                        "OpenAQ station %s (%s) returned 0 observations in fetch window [%s to %s] "
+                        "(station latest transmission: %s).",
+                        openaq_loc.name,
+                        openaq_loc.id,
+                        dt_from.isoformat(),
+                        dt_to.isoformat(),
+                        openaq_loc.datetime_last,
+                    )
 
                 # Deduplicate and persist readings
                 inserted, skipped_dup, rejected = self._persist_readings(
@@ -579,8 +590,8 @@ class OpenAQIngestionService:
             dt_from = latest_ts - timedelta(hours=1)
             return dt_from, now_utc, False
 
-        # Initial ingestion bounded by history_days (max 14)
-        safe_days = min(max(history_days, 1), 14)
+        # Initial ingestion bounded by history_days (max 30)
+        safe_days = min(max(history_days, 1), 30)
         dt_from = now_utc - timedelta(days=safe_days)
         return dt_from, now_utc, False
 

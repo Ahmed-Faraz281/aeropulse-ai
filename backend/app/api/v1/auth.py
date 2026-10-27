@@ -11,7 +11,28 @@ from backend.app.schemas.user import LoginRequest, Token, UserResponse
 router = APIRouter()
 
 
-@router.post("/login", response_model=Token, summary="User Authentication & Token Issuance")
+login_request_schema = LoginRequest.model_json_schema()
+
+
+@router.post(
+    "/login",
+    response_model=Token,
+    summary="User Authentication & Token Issuance",
+    openapi_extra={
+        "requestBody": {
+            "description": "User authentication credentials (username or email and password)",
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": login_request_schema,
+                },
+                "application/x-www-form-urlencoded": {
+                    "schema": login_request_schema,
+                },
+            },
+        }
+    },
+)
 async def login(
     request: Request,
     db: Session = Depends(get_db),

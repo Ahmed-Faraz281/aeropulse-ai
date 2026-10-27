@@ -140,12 +140,12 @@ class OpenAQLocationSearchQuery(BaseModel):
 class OpenAQIngestRequest(BaseModel):
     """
     Request payload for OpenAQ historical ingestion and dynamic station discovery.
-    Bound by safety limits: max 5 stations per request, max 14 days history.
+    Bound by safety limits: max 5 stations per request, max 30 days history.
     """
     latitude: Optional[float] = Field(None, ge=-90.0, le=90.0, description="Center latitude (-90 to 90)")
     longitude: Optional[float] = Field(None, ge=-180.0, le=180.0, description="Center longitude (-180 to 180)")
     radius: int = Field(default=25000, ge=0, le=25000, description="Discovery radius in meters (0 to 25,000m)")
-    history_days: int = Field(default=7, ge=1, le=14, description="Historical days to ingest (1 to 14)")
+    history_days: int = Field(default=7, ge=1, le=30, description="Historical days to ingest (1 to 30)")
     max_locations: int = Field(default=5, ge=1, le=5, description="Max OpenAQ stations to process (1 to 5 per request)")
     location_ids: Optional[List[int]] = Field(None, description="Optional explicit OpenAQ location IDs (max 5)")
 
@@ -161,6 +161,14 @@ class OpenAQIngestRequest(BaseModel):
                 if loc_id <= 0:
                     raise ValueError(f"Invalid location ID: {loc_id}. Must be positive integer.")
         return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def harmonize_history_days(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "days_history" in data and "history_days" not in data:
+                data["history_days"] = data.pop("days_history")
+        return data
 
     @model_validator(mode="after")
     def validate_discovery_params(self) -> "OpenAQIngestRequest":

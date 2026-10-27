@@ -682,14 +682,149 @@ def test_idempotent_repeated_ingestion():
     db.close()
 
 
-# 31. Rejection of history_days > 14 (HTTP 422)
+# 31. history_days bounds check: valid (1, 14, 15, 30), invalid (0, 31 -> HTTP 422)
 def test_history_days_bounds_check():
-    response = client.post(
+    # 0 is below minimum (ge=1) -> 422
+    r_zero = client.post(
         "/api/v1/openaq/ingest",
-        json={"latitude": 13.0, "longitude": 77.5, "history_days": 15},
+        json={"latitude": 13.0, "longitude": 77.5, "history_days": 0},
         headers={"Authorization": f"Bearer {admin_token}"},
     )
-    assert response.status_code == 422
+    assert r_zero.status_code == 422
+
+    # 31 is above maximum (le=30) -> 422
+    r_31 = client.post(
+        "/api/v1/openaq/ingest",
+        json={"latitude": 13.0, "longitude": 77.5, "history_days": 31},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert r_31.status_code == 422
+
+    # Valid values: 1, 14, 15, 30 should pass schema validation
+    from backend.app.schemas.openaq import OpenAQIngestRequest
+    for valid_days in [1, 14, 15, 30]:
+        req = OpenAQIngestRequest(latitude=13.0, longitude=77.5, history_days=valid_days)
+        assert req.history_days == valid_days
+
+    for invalid_days in [0, 31, -5, 100]:
+        with pytest.raises(Exception):
+            OpenAQIngestRequest(latitude=13.0, longitude=77.5, history_days=invalid_days)
+
+
+# 31b. 30-day historical time window calculation
+def test_determine_time_window_30_days():
+    db = TestingSessionLocal()
+    service = OpenAQIngestionService(db=db)
+    source = service._get_or_create_datasource()
+    loc = service._get_or_create_location(make_mock_location(999, "Test Station 30 Days"))
+
+    dt_from, dt_to, is_skipped = service._determine_time_window(loc.id, source.id, 30)
+    assert is_skipped is False
+    delta = dt_to - dt_from
+    assert delta.days >= 29
+    assert delta.days <= 30
+    db.close()
+
+
+# 31c. 30-day historical ingestion pipeline end-to-end
+def test_openaq_ingestion_30_days_pipeline_end_to_end():
+    db = TestingSessionLocal()
+    service = OpenAQIngestionService(db=db)
+
+    mock_openaq = MagicMock(spec=OpenAQService)
+    loc_norm = make_mock_location(8888, "Hebbal 30-Day", 13.029, 77.585)
+    mock_openaq.search_locations.return_value = [loc_norm]
+
+    s_pm25 = make_mock_sensor(101, "pm25", "µg/m³")
+    s_no2 = make_mock_sensor(102, "no2", "µg/m³")
+    mock_openaq.get_location_sensors.return_value = [s_pm25, s_no2]
+
+    now_utc = datetime.now(timezone.utc)
+    t_25d_ago = (now_utc - timedelta(days=25)).replace(minute=0, second=0, microsecond=0)
+    t_1d_ago = (now_utc - timedelta(days=1)).replace(minute=0, second=0, microsecond=0)
+
+    def mock_get_hours(sensor_id, limit=100, page=None, datetime_from=None, datetime_to=None):
+        # Verify requested datetime_from reaches back ~30 days
+        assert datetime_from is not None
+        assert (now_utc - datetime_from).days >= 29
+
+        if sensor_id == 101:
+            return OpenAQSensorHoursResponse(
+                sensor_id=101,
+                parameter_name="pm25",
+                units="µg/m³",
+                total_records=2,
+                measurements=[
+                    OpenAQHourlyMeasurement(
+                        datetime_from_utc=t_25d_ago,
+                        datetime_to_utc=t_25d_ago + timedelta(hours=1),
+                        value=55.0,
+                    ),
+                    OpenAQHourlyMeasurement(
+                        datetime_from_utc=t_1d_ago,
+                        datetime_to_utc=t_1d_ago + timedelta(hours=1),
+                        value=35.0,
+                    ),
+                ],
+            )
+        elif sensor_id == 102:
+            return OpenAQSensorHoursResponse(
+                sensor_id=102,
+                parameter_name="no2",
+                units="µg/m³",
+                total_records=2,
+                measurements=[
+                    OpenAQHourlyMeasurement(
+                        datetime_from_utc=t_25d_ago,
+                        datetime_to_utc=t_25d_ago + timedelta(hours=1),
+                        value=22.0,
+                    ),
+                    OpenAQHourlyMeasurement(
+                        datetime_from_utc=t_1d_ago,
+                        datetime_to_utc=t_1d_ago + timedelta(hours=1),
+                        value=18.0,
+                    ),
+                ],
+            )
+        return OpenAQSensorHoursResponse(sensor_id=sensor_id, parameter_name="unknown", units="", total_records=0)
+
+    mock_openaq.get_sensor_hours.side_effect = mock_get_hours
+    service.openaq = mock_openaq
+
+    req = OpenAQIngestRequest(
+        latitude=13.029,
+        longitude=77.585,
+        radius=5000,
+        max_locations=1,
+        history_days=30,
+    )
+    res = service.ingest(req)
+
+    assert res.status == "success"
+    assert res.locations_processed == 1
+    assert res.observations_inserted == 2
+    assert "PM25" in res.pollutants_mapped
+    assert "NO2" in res.pollutants_mapped
+
+    # Verify persisted records in db
+    readings = (
+        db.query(AirQualityReading)
+        .filter(AirQualityReading.location_id == res.stations[0].location_id)
+        .order_by(AirQualityReading.timestamp.asc())
+        .all()
+    )
+    assert len(readings) == 2
+    # Verify strict NULL missing value preservation
+    assert readings[0].pm25 == 55.0
+    assert readings[0].no2 == 22.0
+    assert readings[0].co is None
+    assert readings[0].so2 is None
+    assert readings[0].o3 is None
+
+    assert readings[1].pm25 == 35.0
+    assert readings[1].no2 == 18.0
+    assert readings[1].co is None
+    db.close()
 
 
 # 32. Rejection of max_locations > 5 (HTTP 422)
@@ -869,3 +1004,118 @@ def test_partial_station_failure_isolation():
     r_db = db.query(AirQualityReading).filter(AirQualityReading.location_id == loc1_db.id).first()
     assert r_db is not None
     db.close()
+
+
+# 38. Zero observations returned when station is inactive during requested history window
+def test_station_zero_observations_when_inactive_in_window_and_recovery():
+    """
+    Regression test for zero observations fetched when a station's latest observation
+    is older than the requested history window (e.g., station silent for 48h, history_days=1).
+    Verifies HTTP 200, observations_fetched=0, observations_inserted=0, no errors,
+    and recovery when history_days is increased to encompass datetime_last.
+    """
+    db = TestingSessionLocal()
+    service = OpenAQIngestionService(db=db)
+
+    now_utc = datetime.now(timezone.utc)
+    station_last = now_utc - timedelta(hours=48)  # Station silent for 48 hours
+
+    loc_norm = make_mock_location(
+        6984,
+        "Hebbal, Bengaluru - KSPCB",
+        13.0358,
+        77.5970,
+    )
+    loc_norm.datetime_last = station_last
+
+    s_pm25 = make_mock_sensor(12235249, "pm25", "µg/m³", datetime_last=station_last)
+    s_pm10 = make_mock_sensor(12235248, "pm10", "µg/m³", datetime_last=station_last)
+    s_no2 = make_mock_sensor(12235246, "no2", "ppb", datetime_last=station_last)
+    s_so2 = make_mock_sensor(12235251, "so2", "ppb", datetime_last=station_last)
+    s_co = make_mock_sensor(12235244, "co", "ppb", datetime_last=station_last)
+    s_o3 = make_mock_sensor(12235247, "o3", "ppb", datetime_last=station_last)
+    s_temp = make_mock_sensor(12235252, "temperature", "c", datetime_last=station_last)
+    s_rh = make_mock_sensor(12235250, "relativehumidity", "%", datetime_last=station_last)
+
+    all_sensors = [s_pm25, s_pm10, s_no2, s_so2, s_co, s_o3, s_temp, s_rh]
+
+    mock_openaq = MagicMock(spec=OpenAQService)
+    mock_openaq.get_location.return_value = loc_norm
+    mock_openaq.search_locations.return_value = [loc_norm]
+    mock_openaq.get_location_sensors.return_value = all_sensors
+
+    # Step 1: When history_days=1, datetime_from is now - 24h. Upstream returns 0 records.
+    def mock_get_hours(sensor_id, limit=100, datetime_from=None, datetime_to=None):
+        param = "pm25"
+        units = "µg/m³"
+        for sn in all_sensors:
+            if sn.id == sensor_id:
+                param = sn.parameter_name
+                units = sn.units
+                break
+        if datetime_from and datetime_from > station_last:
+            # Query window starts AFTER the station's latest reading -> 0 records
+            return OpenAQSensorHoursResponse(
+                sensor_id=sensor_id,
+                parameter_name=param,
+                units=units,
+                total_records=0,
+                measurements=[],
+            )
+        else:
+            # Query window encompasses station_last -> return measurements
+            return OpenAQSensorHoursResponse(
+                sensor_id=sensor_id,
+                parameter_name=param,
+                units=units,
+                total_records=1,
+                measurements=[
+                    OpenAQHourlyMeasurement(
+                        datetime_from_utc=station_last - timedelta(hours=1),
+                        datetime_to_utc=station_last,
+                        value=35.0,
+                    )
+                ],
+            )
+
+    mock_openaq.get_sensor_hours.side_effect = mock_get_hours
+    service.openaq = mock_openaq
+
+    # Request with history_days=1
+    req_1day = OpenAQIngestRequest(
+        latitude=13.0358,
+        longitude=77.5970,
+        radius=5000,
+        history_days=1,
+        max_locations=1,
+        location_ids=[6984],
+    )
+    res_1day = service.ingest(req_1day)
+
+    assert res_1day.locations_processed == 1
+    assert res_1day.sensors_discovered == 8
+    assert res_1day.sensors_selected == 8
+    assert res_1day.observations_fetched == 0
+    assert res_1day.observations_inserted == 0
+    assert res_1day.errors == []
+    assert res_1day.predictions_generated == 0
+    assert res_1day.models_retrained is False
+
+    # Step 2: Now re-request with history_days=3 (which encompasses station_last at -48h)
+    req_3day = OpenAQIngestRequest(
+        latitude=13.0358,
+        longitude=77.5970,
+        radius=5000,
+        history_days=3,
+        max_locations=1,
+        location_ids=[6984],
+    )
+    res_3day = service.ingest(req_3day)
+
+    assert res_3day.locations_processed == 1
+    assert res_3day.observations_fetched > 0
+    assert res_3day.observations_inserted > 0
+    assert res_3day.errors == []
+
+    db.close()
+

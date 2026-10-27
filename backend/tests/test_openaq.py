@@ -590,3 +590,190 @@ def test_openaq_rbac_authorization():
         headers={"Authorization": f"Bearer {admin_token}"},
     )
     assert r_admin.status_code == 200
+
+
+# ==============================================================================
+# TEST 15: Sensor Hours Pagination: Multi-page retrieval & termination
+# ==============================================================================
+def test_openaq_get_sensor_hours_pagination_multi_page():
+    mock_meta_resp = httpx.Response(
+        status_code=200,
+        json={"results": [SAMPLE_SENSOR_RAW_PM25]},
+        request=httpx.Request("GET", "https://api.openaq.org/v3/sensors/12235249"),
+    )
+    # Page 1: 2 records (len == limit)
+    mock_page1_resp = httpx.Response(
+        status_code=200,
+        json={
+            "meta": {"page": 1, "limit": 2, "found": ">2"},
+            "results": [
+                {
+                    "period": {
+                        "datetimeFrom": {"utc": "2024-05-01T10:00:00Z"},
+                        "datetimeTo": {"utc": "2024-05-01T11:00:00Z"},
+                    },
+                    "value": 40.0,
+                    "coverage": {"percentComplete": 100.0, "observedCount": 1},
+                },
+                {
+                    "period": {
+                        "datetimeFrom": {"utc": "2024-05-01T11:00:00Z"},
+                        "datetimeTo": {"utc": "2024-05-01T12:00:00Z"},
+                    },
+                    "value": 42.0,
+                    "coverage": {"percentComplete": 100.0, "observedCount": 1},
+                },
+            ],
+        },
+        request=httpx.Request("GET", "https://api.openaq.org/v3/sensors/12235249/hours?page=1&limit=2"),
+    )
+    # Page 2: 1 record (len < limit -> terminates without page 3)
+    mock_page2_resp = httpx.Response(
+        status_code=200,
+        json={
+            "meta": {"page": 2, "limit": 2, "found": 3},
+            "results": [
+                {
+                    "period": {
+                        "datetimeFrom": {"utc": "2024-05-01T12:00:00Z"},
+                        "datetimeTo": {"utc": "2024-05-01T13:00:00Z"},
+                    },
+                    "value": 45.0,
+                    "coverage": {"percentComplete": 100.0, "observedCount": 1},
+                },
+            ],
+        },
+        request=httpx.Request("GET", "https://api.openaq.org/v3/sensors/12235249/hours?page=2&limit=2"),
+    )
+
+    mock_client = MagicMock(spec=httpx.Client)
+    # 2 hours pages + 1 sensor metadata fetch
+    mock_client.request.side_effect = [mock_page1_resp, mock_page2_resp, mock_meta_resp]
+
+    service = OpenAQService(api_key="valid-key", client=mock_client)
+    res = service.get_sensor_hours(12235249, limit=2)
+
+    assert res.total_records == 3
+    assert len(res.measurements) == 3
+    assert res.measurements[0].value == 40.0
+    assert res.measurements[1].value == 42.0
+    assert res.measurements[2].value == 45.0
+    # Exactly 2 page calls + 1 metadata call = 3 total requests
+    assert mock_client.request.call_count == 3
+
+
+# ==============================================================================
+# TEST 16: Sensor Hours Pagination: Duplicate observation deduplication across pages
+# ==============================================================================
+def test_openaq_get_sensor_hours_pagination_deduplicates_overlapping_observations():
+    mock_meta_resp = httpx.Response(
+        status_code=200,
+        json={"results": [SAMPLE_SENSOR_RAW_PM25]},
+        request=httpx.Request("GET", "https://api.openaq.org/v3/sensors/12235249"),
+    )
+    # Page 1: T10 and T11
+    mock_page1 = httpx.Response(
+        status_code=200,
+        json={
+            "meta": {"page": 1, "limit": 2, "found": ">2"},
+            "results": [
+                {
+                    "period": {
+                        "datetimeFrom": {"utc": "2024-05-01T10:00:00Z"},
+                        "datetimeTo": {"utc": "2024-05-01T11:00:00Z"},
+                    },
+                    "value": 30.0,
+                },
+                {
+                    "period": {
+                        "datetimeFrom": {"utc": "2024-05-01T11:00:00Z"},
+                        "datetimeTo": {"utc": "2024-05-01T12:00:00Z"},
+                    },
+                    "value": 32.0,
+                },
+            ],
+        },
+        request=httpx.Request("GET", "https://api.openaq.org/v3/sensors/12235249/hours?page=1&limit=2"),
+    )
+    # Page 2: T11 (duplicate overlap) and T12
+    mock_page2 = httpx.Response(
+        status_code=200,
+        json={
+            "meta": {"page": 2, "limit": 2, "found": 3},
+            "results": [
+                {
+                    "period": {
+                        "datetimeFrom": {"utc": "2024-05-01T11:00:00Z"},
+                        "datetimeTo": {"utc": "2024-05-01T12:00:00Z"},
+                    },
+                    "value": 32.0,
+                },
+                {
+                    "period": {
+                        "datetimeFrom": {"utc": "2024-05-01T12:00:00Z"},
+                        "datetimeTo": {"utc": "2024-05-01T13:00:00Z"},
+                    },
+                    "value": 35.0,
+                },
+            ],
+        },
+        request=httpx.Request("GET", "https://api.openaq.org/v3/sensors/12235249/hours?page=2&limit=2"),
+    )
+
+    mock_client = MagicMock(spec=httpx.Client)
+    mock_client.request.side_effect = [mock_page1, mock_page2, mock_meta_resp]
+
+    service = OpenAQService(api_key="valid-key", client=mock_client)
+    res = service.get_sensor_hours(12235249, limit=2)
+
+    # 3 unique hours: T10, T11, T12 (duplicate T11 suppressed)
+    assert res.total_records == 3
+    assert len(res.measurements) == 3
+    hours = [m.datetime_from_utc.isoformat() for m in res.measurements]
+    assert len(set(hours)) == 3
+
+
+# ==============================================================================
+# TEST 17: Sensor Hours Pagination: Explicit single-page mode
+# ==============================================================================
+def test_openaq_get_sensor_hours_explicit_single_page_mode():
+    mock_meta_resp = httpx.Response(
+        status_code=200,
+        json={"results": [SAMPLE_SENSOR_RAW_PM25]},
+        request=httpx.Request("GET", "https://api.openaq.org/v3/sensors/12235249"),
+    )
+    mock_page2_resp = httpx.Response(
+        status_code=200,
+        json={
+            "meta": {"page": 2, "limit": 2, "found": ">2"},
+            "results": [
+                {
+                    "period": {
+                        "datetimeFrom": {"utc": "2024-05-01T12:00:00Z"},
+                        "datetimeTo": {"utc": "2024-05-01T13:00:00Z"},
+                    },
+                    "value": 45.0,
+                },
+                {
+                    "period": {
+                        "datetimeFrom": {"utc": "2024-05-01T13:00:00Z"},
+                        "datetimeTo": {"utc": "2024-05-01T14:00:00Z"},
+                    },
+                    "value": 48.0,
+                },
+            ],
+        },
+        request=httpx.Request("GET", "https://api.openaq.org/v3/sensors/12235249/hours?page=2&limit=2"),
+    )
+
+    mock_client = MagicMock(spec=httpx.Client)
+    mock_client.request.side_effect = [mock_page2_resp, mock_meta_resp]
+
+    service = OpenAQService(api_key="valid-key", client=mock_client)
+    # Caller requests page=2 explicitly
+    res = service.get_sensor_hours(12235249, limit=2, page=2)
+
+    assert res.total_records == 2
+    # Exactly 1 page request + 1 metadata request = 2 total requests
+    assert mock_client.request.call_count == 2
+

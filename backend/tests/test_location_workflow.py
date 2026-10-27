@@ -1061,3 +1061,57 @@ def test_location_workflow_alternative_station_numeric_id_matches_stored_string(
             assert isinstance(alt.location_id, int)
             assert alt.location_id > 0
 
+
+def test_ghost_station_without_telemetry_falls_back_to_active_station(db_session):
+    """
+    Verifies that a closer ghost/abandoned station with datetime_last=None
+    (no historical telemetry) automatically falls back to the nearest station
+    that has active telemetry observations.
+    """
+    service = LocationWorkflowService(db=db_session)
+    user_lat, user_lon = 13.000, 77.500
+
+    # s_ghost is very close (~1 km) but has NO telemetry (datetime_last is None)
+    s_ghost = make_mock_openaq_location(229473, "Ghost Empty Station", 13.010, 77.500, ["pm25"])
+    s_ghost.datetime_last = None
+    # s_active is slightly farther (~3.5 km) and has real observations
+    now = datetime.now(timezone.utc)
+    s_active = make_mock_openaq_location(3409388, "Active Monitoring Station", 13.030, 77.500, ["pm25", "pm10"], last_dt=now)
+
+    with patch.object(service.openaq, "search_locations", return_value=[s_ghost, s_active]):
+        with patch.object(service.ingest_service, "ingest"):
+            req = LocationWorkflowRequest(latitude=user_lat, longitude=user_lon, radius_meters=25000, force_refresh=True)
+            res = service.resolve_location(req)
+
+            assert res.status in ("SUCCESS", "PARTIAL_SUCCESS")
+            # Must resolve to active station, NOT the ghost station
+            assert res.resolved_station.external_id == 3409388
+            assert res.resolved_station.name == "Active Monitoring Station"
+            # Ghost station should be in alternatives
+            assert any(alt.external_id == 229473 for alt in res.alternative_stations)
+
+
+def test_all_ghost_stations_gracefully_presents_empty_state(db_session):
+    """
+    Verifies that if ALL stations in radius have datetime_last=None,
+    the workflow resolves the nearest station gracefully with UNAVAILABLE freshness and None AQI.
+    """
+    service = LocationWorkflowService(db=db_session)
+    user_lat, user_lon = 13.000, 77.500
+
+    s_ghost1 = make_mock_openaq_location(8001, "Ghost Station 1", 13.010, 77.500, ["pm25"])
+    s_ghost1.datetime_last = None
+    s_ghost2 = make_mock_openaq_location(8002, "Ghost Station 2", 13.020, 77.500, ["pm25"])
+    s_ghost2.datetime_last = None
+
+    with patch.object(service.openaq, "search_locations", return_value=[s_ghost1, s_ghost2]):
+        with patch.object(service.ingest_service, "ingest"):
+            req = LocationWorkflowRequest(latitude=user_lat, longitude=user_lon, radius_meters=25000, force_refresh=True)
+            res = service.resolve_location(req)
+
+            assert res.status in ("SUCCESS", "PARTIAL_SUCCESS")
+            assert res.resolved_station.external_id == 8001
+            assert res.resolved_station.data_freshness == "UNAVAILABLE"
+            assert res.current_aqi is None
+
+

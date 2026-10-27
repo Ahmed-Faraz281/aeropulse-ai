@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     SCHEDULER_INTERVAL_MINUTES: int = 60
     SCHEDULER_POLL_MINUTE: int = 15
     SCHEDULER_MAX_STATIONS_PER_RUN: int = 10
+    SCHEDULER_SECRET_KEY: Optional[str] = None
 
     @field_validator("SCHEDULER_INTERVAL_MINUTES")
     @classmethod

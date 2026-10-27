@@ -250,9 +250,13 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
 
       if (readingRes.status === 'fulfilled') {
         setCurrentReading(readingRes.value.reading);
+      } else {
+        setCurrentReading(null);
       }
       if (aqiRes.status === 'fulfilled') {
         setLatestAQI(aqiRes.value);
+      } else {
+        setLatestAQI(null);
       }
       if (aqiTrendRes.status === 'fulfilled') {
         setAqiTrend(aqiTrendRes.value);
@@ -360,6 +364,12 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                 return prev;
               });
               setSelectedLocationId(stationId);
+              if (res.current_aqi) {
+                setLatestAQI(res.current_aqi);
+              } else {
+                setLatestAQI(null);
+              }
+              setCurrentReading(null);
               onLocationSelect?.(stationId);
               loadDashboardData(stationId);
             }
@@ -785,7 +795,11 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
         </div>
         <div className="lg:col-span-7">
           <div className="p-6 rounded-2xl bg-slate-900/60 border border-slate-800 shadow-xl h-full flex flex-col justify-between">
-            <PollutantOverview reading={currentReading} isLoading={loadingDashboard} />
+            <PollutantOverview
+              reading={currentReading}
+              latestAQI={latestAQI}
+              isLoading={loadingDashboard}
+            />
           </div>
         </div>
       </div>

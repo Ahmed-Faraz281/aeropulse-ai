@@ -788,3 +788,84 @@ def test_ml_prediction_sufficient_history_and_insufficient_history_handling():
         predict_with_general_model(mock_db, location_id=1, horizon_hours=1)
 
 
+# ==============================================================================
+# 13. External Cron Trigger & Standalone CLI Runner Tests
+# ==============================================================================
+
+def test_cron_trigger_unconfigured_or_missing_token_401(client):
+    """Rejects calls when SCHEDULER_SECRET_KEY is None or token missing."""
+    with patch("backend.app.core.config.settings.SCHEDULER_SECRET_KEY", None):
+        response = client.post("/api/v1/automation/cron-trigger")
+        assert response.status_code == 401
+        assert "Invalid or unconfigured scheduler token" in response.json()["detail"]
+
+
+def test_cron_trigger_invalid_token_401(client):
+    """Rejects calls with incorrect X-Scheduler-Token."""
+    with patch("backend.app.core.config.settings.SCHEDULER_SECRET_KEY", "correct-secret"):
+        response = client.post(
+            "/api/v1/automation/cron-trigger",
+            headers={"X-Scheduler-Token": "wrong-secret"},
+        )
+        assert response.status_code == 401
+
+
+def test_cron_trigger_valid_token_accepted_200(client):
+    """Accepts calls with matching X-Scheduler-Token and launches cycle."""
+    with patch("backend.app.core.config.settings.SCHEDULER_SECRET_KEY", "valid-secret-123"):
+        with patch("backend.app.services.automation_service.AutomationSupervisor.run_sync_cycle", new_callable=AsyncMock) as mock_sync:
+            response = client.post(
+                "/api/v1/automation/cron-trigger",
+                headers={"X-Scheduler-Token": "valid-secret-123"},
+            )
+            assert response.status_code == 200
+            data = response.json()
+            assert data["status"] == "accepted"
+            assert "external cron webhook" in data["message"]
+
+
+def test_cron_trigger_conflict_409(client):
+    """Returns 409 when automation supervisor lock is already locked."""
+    with patch("backend.app.core.config.settings.SCHEDULER_SECRET_KEY", "valid-secret-123"):
+        supervisor = get_automation_supervisor()
+        # Acquire the lock
+        async def mock_lock():
+            await supervisor._lock.acquire()
+        asyncio.run(mock_lock())
+        try:
+            response = client.post(
+                "/api/v1/automation/cron-trigger",
+                headers={"X-Scheduler-Token": "valid-secret-123"},
+            )
+            assert response.status_code == 409
+            assert "already in progress" in response.json()["detail"]
+        finally:
+            supervisor._lock.release()
+
+
+@pytest.mark.asyncio
+async def test_run_scheduled_sync_script():
+    """Validates standalone CLI main() executes supervisor.run_sync_cycle()."""
+    from backend.scripts.run_scheduled_sync import main
+    with patch("backend.scripts.run_scheduled_sync.check_db_connection", return_value={"ok": True}):
+        with patch("backend.scripts.run_scheduled_sync.get_automation_supervisor") as mock_get_sup:
+            mock_sup = MagicMock()
+            mock_summary = MagicMock(
+                status="success",
+                stations_processed=1,
+                stations_failed=0,
+                observations_ingested=10,
+                predictions_generated=5,
+                duration_seconds=1.2,
+                errors=[],
+            )
+            mock_sup.run_sync_cycle = AsyncMock(return_value=mock_summary)
+            mock_get_sup.return_value = mock_sup
+
+            with pytest.raises(SystemExit) as exc_info:
+                await main()
+            assert exc_info.value.code == 0
+            mock_sup.run_sync_cycle.assert_called_once_with(source="cron_job")
+
+
+

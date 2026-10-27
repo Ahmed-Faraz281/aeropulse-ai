@@ -269,3 +269,76 @@ def test_openapi_schema_contains_auth():
     assert "/api/v1/auth/login" in schema["paths"]
     assert "/api/v1/auth/me" in schema["paths"]
     assert "OAuth2PasswordBearer" in schema["components"]["securitySchemes"]
+
+
+# TEST 11: OpenAPI Documentation exposes requestBody for /api/v1/auth/login
+def test_openapi_schema_documents_login_request_body():
+    response = client.get("/api/v1/openapi.json")
+    assert response.status_code == 200
+    schema = response.json()
+    login_post = schema["paths"]["/api/v1/auth/login"]["post"]
+    assert "requestBody" in login_post, "Swagger / OpenAPI must document requestBody for login endpoint"
+    content = login_post["requestBody"]["content"]
+    assert "application/json" in content
+    json_schema = content["application/json"]["schema"]
+    assert "username" in json_schema["properties"]
+    assert "password" in json_schema["properties"]
+    assert "username" in json_schema["required"]
+    assert "password" in json_schema["required"]
+
+
+# TEST 12: Login with URL-encoded form data compatibility
+def test_successful_login_with_form_data():
+    response = client.post(
+        "/api/v1/auth/login",
+        data={"username": "admin_test", "password": "AdminPass123!"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "access_token" in data
+    assert data["token_type"] == "bearer"
+    assert data["user"]["username"] == "admin_test"
+
+
+# TEST 13: Login with email address instead of username
+def test_successful_login_with_email():
+    response = client.post(
+        "/api/v1/auth/login",
+        json={"username": "admin@test.org", "password": "AdminPass123!"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "access_token" in data
+    assert data["user"]["username"] == "admin_test"
+
+
+# TEST 14: Empty login request returns HTTP 400 Invalid request body format
+def test_login_empty_body_rejected():
+    response = client.post("/api/v1/auth/login")
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid request body format"
+
+
+# TEST 15: Malformed JSON body returns HTTP 400 Invalid request body format
+def test_login_malformed_json_rejected():
+    response = client.post(
+        "/api/v1/auth/login",
+        content=b"not-valid-json",
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid request body format"
+
+
+# TEST 16: Missing username or password returns HTTP 400 Both username and password are required
+def test_login_missing_credentials_rejected():
+    # Missing password
+    res1 = client.post("/api/v1/auth/login", json={"username": "admin_test"})
+    assert res1.status_code == 400
+    assert res1.json()["detail"] == "Both username and password are required"
+
+    # Missing username
+    res2 = client.post("/api/v1/auth/login", json={"password": "AdminPass123!"})
+    assert res2.status_code == 400
+    assert res2.json()["detail"] == "Both username and password are required"
+

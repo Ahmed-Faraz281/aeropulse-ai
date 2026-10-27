@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from backend.app.api.deps import get_current_user, get_db, require_role
+from backend.app.core.config import settings
 from backend.app.models.user import User, UserRole
 from backend.app.schemas.automation import (
     AutomationActionResponse,
@@ -74,6 +75,47 @@ async def trigger_cycle(
     return AutomationTriggerResponse(
         status="accepted",
         message="Automation sync cycle initiated.",
+        started_at=datetime.now(timezone.utc),
+    )
+
+
+@router.post(
+    "/cron-trigger",
+    response_model=AutomationTriggerResponse,
+    summary="Trigger Automation Sync Cycle via External Webhook / Cron",
+    description="Accepts an X-Scheduler-Token header matching configured SCHEDULER_SECRET_KEY to safely trigger an automated sync cycle from an external cron service.",
+)
+async def cron_trigger(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Webhook trigger for external schedulers (Render Cron, GitHub Actions, cron-job.org).
+    Requires pre-shared secret in X-Scheduler-Token header matching settings.SCHEDULER_SECRET_KEY.
+    """
+    token = request.headers.get("X-Scheduler-Token")
+    if not settings.SCHEDULER_SECRET_KEY or not token or token != settings.SCHEDULER_SECRET_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or unconfigured scheduler token",
+        )
+
+    supervisor = get_automation_supervisor()
+
+    if supervisor._lock.locked():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Automation job is already in progress.",
+        )
+
+    # Launch cycle asynchronously in background without blocking
+    asyncio.create_task(
+        supervisor.run_sync_cycle(source="external_cron_webhook")
+    )
+
+    return AutomationTriggerResponse(
+        status="accepted",
+        message="Automation sync cycle initiated via external cron webhook.",
         started_at=datetime.now(timezone.utc),
     )
 
